@@ -1,179 +1,127 @@
 (async () => {
 
-  /*************************************************
-   * SECTION 1 — GET USER + CONVERSATION DATA
-   *************************************************/
-
-  // Step 1: Fetch organization info (Claude requires orgId)
-  const organizationResponse = await fetch("/api/organizations", {
+  // ===== FETCH ORG =====
+  const orgPayload = await fetch("/api/organizations", {
     credentials: "include"
-  });
+  }).then(r => r.json());
 
-  const organizationData = await organizationResponse.json();
+  const orgId =
+    orgPayload[0]?.uuid ||
+    orgPayload.organizations?.[0]?.uuid;
 
-  // Claude sometimes returns different shapes
-  const organizationId =
-    organizationData[0]?.uuid ||
-    organizationData.organizations?.[0]?.uuid;
+  if (!orgId) return;
 
-  if (!organizationId) {
-    console.error("Could not determine organization ID.");
-    return;
-  }
 
-  // Step 2: Extract conversation ID from current URL
-  const currentUrl = window.location.pathname;
-  const conversationId = currentUrl.split("/chat/")[1];
+  // ===== GET CONVERSATION ID =====
+  const urlPath = window.location.pathname;
+  const chatId = urlPath.split("/chat/")[1];
 
-  if (!conversationId) {
-    console.error("No conversation ID found in URL.");
-    return;
-  }
+  if (!chatId) return;
 
-  // Step 3: Fetch FULL conversation tree (not just visible messages)
-  const conversationResponse = await fetch(
-    `/api/organizations/${organizationId}/chat_conversations/${conversationId}?tree=True&rendering_mode=messages&render_all_tools=true`,
+
+  // ===== FETCH CONVERSATION =====
+  const dataBlob = await fetch(
+    `/api/organizations/${orgId}/chat_conversations/${chatId}?tree=True&rendering_mode=messages&render_all_tools=true`,
     { credentials: "include" }
-  );
-
-  const conversationJson = await conversationResponse.json();
+  ).then(r => r.json());
 
 
-  /*************************************************
-   * SECTION 2 — BUILD TREE STRUCTURE
-   *************************************************/
+  // ===== EXTRACT NAME → FILENAME =====
+  function sanitizeFilename(name) {
+    return name
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
+      .replace(/\s+/g, "_")
+      .slice(0, 100);
+  }
 
-  // Claude may store messages under different keys
-  const allMessages =
-    conversationJson.chat_messages ||
-    conversationJson.messages;
+  const fileLabel =
+    sanitizeFilename(dataBlob.name || "claude_tree") + ".xml";
 
-  // Maps for fast lookup
-  const messageById = {};      // uuid → message
-  const childrenByParent = {}; // parent_uuid → [child_uuid]
 
-  // Special root parent UUID used by Claude
-  const ROOT_PARENT_UUID = "00000000-0000-4000-8000-000000000000";
+  // ===== BUILD TREE =====
+  const entries =
+    dataBlob.chat_messages || dataBlob.messages;
 
-  let rootMessageId = null;
+  const lookup = {};
+  const branches = {};
+  const zeroParent = "00000000-0000-4000-8000-000000000000";
 
-  // Initialize maps
-  allMessages.forEach(message => {
-    messageById[message.uuid] = message;
-    childrenByParent[message.uuid] = [];
+  let rootId = null;
+
+  entries.forEach(item => {
+    lookup[item.uuid] = item;
+    branches[item.uuid] = [];
   });
 
-  // Build parent → children relationships
-  allMessages.forEach(message => {
-    const parentId = message.parent_message_uuid;
+  entries.forEach(item => {
+    const parent = item.parent_message_uuid;
 
-    if (!parentId || parentId === ROOT_PARENT_UUID) {
-      rootMessageId = message.uuid;
-    } else if (childrenByParent[parentId]) {
-      childrenByParent[parentId].push(message.uuid);
+    if (!parent || parent === zeroParent) {
+      rootId = item.uuid;
+    } else if (branches[parent]) {
+      branches[parent].push(item.uuid);
     }
   });
 
-  // Ensure children are ordered chronologically
-  Object.keys(childrenByParent).forEach(parentId => {
-    childrenByParent[parentId].sort((a, b) => {
-      const timeA = new Date(messageById[a].created_at);
-      const timeB = new Date(messageById[b].created_at);
-      return timeA - timeB;
-    });
+  Object.keys(branches).forEach(key => {
+    branches[key].sort((a, b) =>
+      new Date(lookup[a].created_at) -
+      new Date(lookup[b].created_at)
+    );
   });
 
 
-  /*************************************************
-   * SECTION 3 — TEXT EXTRACTION + XML SAFETY
-   *************************************************/
+  // ===== TEXT HELPERS =====
+  const grabText = t =>
+    t.text ||
+    t.content?.map(e => e.text || "").join("\n") ||
+    "";
 
-  function extractMessageText(message) {
-    // Some messages use .text, others use structured content
-    if (message.text) return message.text;
-
-    if (message.content) {
-      return message.content
-        .map(part => part.text || "")
-        .join("\n");
-    }
-
-    return "";
-  }
-
-  function escapeForXML(text) {
-    return text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-  }
+  const sanitizeXML = s =>
+    s.replace(/&/g, "&amp;")
+     .replace(/</g, "&lt;")
+     .replace(/>/g, "&gt;");
 
 
-  /*************************************************
-   * SECTION 4 — TREE WALK + PATH ENCODING
-   *************************************************/
+  // ===== WALK TREE =====
+  let xmlBuffer = "";
 
-  let xmlOutput = "";
+  function walkTree(id, path = "1") {
+    const node = lookup[id];
+    if (!node) return;
 
-  function traverseTree(messageId, currentPath = "1") {
-    const message = messageById[messageId];
-    if (!message) return;
+    const isHuman = node.sender === "human";
+    const role = isHuman ? "human" : "machine";
 
-    // Determine role
-    const isHuman = message.sender === "human";
-    const tagName = isHuman ? "human" : "machine";
+    xmlBuffer += `<${role}_${path}>\n${sanitizeXML(grabText(node))}\n</${role}_${path}>\n\n`;
 
-    // Extract and sanitize text
-    const rawText = extractMessageText(message);
-    const safeText = escapeForXML(rawText);
-
-    // 🔥 YOUR CHANGE: no space in tag
-    xmlOutput += `<${tagName}_${currentPath}>\n${safeText}\n</${tagName}_${currentPath}>\n\n`;
-
-    // Traverse children
-    const childIds = childrenByParent[messageId] || [];
-
-    childIds.forEach((childId, index) => {
-      const childMessage = messageById[childId];
-
-      // 🔥 YOUR CHANGE: "-" for machine, "." for human
-      const delimiter =
-        childMessage.sender === "human" ? "." : "-";
-
-      const nextPath = currentPath + delimiter + (index + 1);
-
-      traverseTree(childId, nextPath);
+    (branches[id] || []).forEach((childId, index) => {
+      const child = lookup[childId];
+      const delim = child.sender === "human" ? "." : "-";
+      walkTree(childId, path + delim + (index + 1));
     });
   }
 
-  if (!rootMessageId) {
-    console.error("Could not find root message.");
-    return;
-  }
-
-  traverseTree(rootMessageId);
+  walkTree(rootId);
 
 
-  /*************************************************
-   * SECTION 5 — FILE DOWNLOAD (MOBILE SAFE)
-   *************************************************/
+  // ===== DOWNLOAD =====
+  const finalXml = `<root>\n${xmlBuffer}</root>`;
 
-  const finalXml = `<root>\n${xmlOutput}</root>`;
-
-  const fileBlob = new Blob([finalXml], {
+  const blobFile = new Blob([finalXml], {
     type: "application/xml"
   });
 
-  const fileUrl = URL.createObjectURL(fileBlob);
+  const objectURL = URL.createObjectURL(blobFile);
 
-  const downloadLink = document.createElement("a");
-  downloadLink.href = fileUrl;
-  downloadLink.download = "claude_tree.xml";
+  const anchor = document.createElement("a");
+  anchor.href = objectURL;
+  anchor.download = fileLabel;
 
-  document.body.appendChild(downloadLink);
-  downloadLink.click();
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
 
-  document.body.removeChild(downloadLink);
-  URL.revokeObjectURL(fileUrl);
+  URL.revokeObjectURL(objectURL);
 
 })();
