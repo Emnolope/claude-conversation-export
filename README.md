@@ -32,6 +32,16 @@ claude_tree.xml
 
 ---
 
+# Step 3 — Deduplicate
+
+https://colab.research.google.com/drive/1ej8-Wj8r3v5dmWLLhxHgDVKQ8zC4lEGw
+
+This will take all the redundancy out of the convo.
+
+# Step 4 - Iterative AI summary.
+
+AI STUIDO CODE BULLSHIT HERE.
+
 ## 📄 WHAT YOU GET
 
 Full conversation tree:
